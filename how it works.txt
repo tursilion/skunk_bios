@@ -1,0 +1,146 @@
+This program is both the boot flasher, and the JCP host.
+
+I will only cover the JCP host here. Note when modifying the
+host that there are multiple addresses:
+
+-The program assembles and loads into RAM for flashing.
+-The program is then burned to ROM where it runs
+-The ROM copies the program to a DIFFERENT address in RAM on start
+
+So take care.
+
+----
+
+JCP command line:
+
+jcp [-rfnboc] file [$base]
+
+-r == hard reset of the jaguar, unless the USB host is completely hosed (then you need to power cycle)
+-f == write a file to the flash - you must use this option to change the flash chip. This will perform an erase cycle and then write your data to the flash chip, then boot it.
+-n == do not boot, just upload the file
+-b == boot only, no file to upload (do not specify file, just base address, unless it's $4000. You can boot the flash this way by specifying $802000)
+-o == override - ignore load address in the header. file and $base MUST be specified
+-c == console - stay active and dump text from the jag (incompatible with -n)
+-d == dump flash - copies the flash contents to a .JAG compatible file (prepending the Universal AB header)
+-s == print serial number - retrieves the serial number from the flash
+
+"file" - name of the file to upload (not required for reset)
+"$base" - hexadecimal address to load the file to (if it is headerless, the default is $4000).
+
+----
+
+Hardware interface:
+
+There are two HPI addresses (all access is 16-bit):
+$C00000 - write address, write mode, read data
+$800000 - write data
+
+Known modes: 
+  $4000 - set Flash write mode
+  $4001 - set flash read only mode
+  $4004 - set HPI write mode
+
+----
+
+JCP Host:
+
+Two buffers are maintained, one at $1800 and one at $2800. Each buffer is
+$FFF (4096) bytes long and contain a 10 byte footer. The blocks
+sent by JCP are 4080 bytes long. The smallest legal block is 8 bytes. This 
+is in EZHost memory, not Jag RAM, so must be accessed over HPI.
+
+0-$FDF 		- Block data (4064 bytes) - byte swapped 16-bits at a time.
+$FE0-$FE3 	- 4 bytes for load address, word order is 2143 (because of 16-bit swaps)
+$FE4-$FE7 	- 4 bytes for start address, or FFFFFFFF if not starting yet (2143 word order)
+$FE8-$FE9	- Address of next buffer (16-bits, byte swapped - today fixed as above)
+$FEA-$FEB	- Length of data in bytes (blocks are rounded up to dwords) (16-bits, byte swapped)
+$FEC-$FEF	- Unused but sent by JCP
+$FF0-$FFF	- Unused
+
+When a buffer is free, the 16-bit word at offset $FEA is set to $FFFF. This helps handshaking.
+
+----
+
+Jag console:
+
+This works after the program starts by watching the same buffers as the JCP host, but this time from the Jaguar to the PC. Only the 4064 byte buffer and the length fields are used - length is treated as bytes in this mode, not dwords.
+
+To use it, your program should simply write the text into the buffer, then set the 16-bit length (watch byte order). The PC will dump the text. It is not necessary to alternate buffers but you will get better performance if you do.
+
+Make sure that you always wait for the length field of your buffer to be equal to $FFFF before writing into it.
+
+There is no notification when the Jag program exits but you can terminate the console by writing \xff\xff\x00\x01 and a length of 4.
+
+You can receive text input from the PC by writing \xff\xff\x00\x02 and a length of 4. The data will be dumped into the other buffer with a valid length (and will overwrite anything already there, so don't use this function and continue to write debug to the alternate buffer). The string will ALSO be NUL terminated (ie: the last character will be 0). Text output mode will resume when you clear this alternate buffer by setting the length back to $FFFF. Note that you can break and reconnect the console during text output but if you interrupt the input sequence, the Jaguar will not resume on reconnecting the console.
+
+For the following file transfer functions, JCP supports only one open file at a time. You can read or write, not both, and only sequential access is supported. Paths are not supported and files will be accessed in the current working directory only. These functions are all synchronous in that they will wait for the PC to acknowledge the buffer before returning - this can cause a hang if the console disconnects at just the right time, but the Jag should resume if the console is reconnected.
+
+\xff\xff\x00\x03<filename>\x00	- open a file for writing (an existing file is overwritten). Note that failure is not communicated back to the Jaguar. The filename must be NUL terminated and any path information will be stripped.
+
+\xff\xff\x00\x04<filename>\x00	- open a file for reading (file must exist). Note that failure is not communicated back to the Jaguar. The filename must be NUL terminated and any path information will be stripped.
+
+\xff\xff\x00\x05<data>		    - write up to 4060 bytes of data to the file. The length field must be the total size used including the 4 bytes of header.
+
+\xff\xff\x00\x06				- read a block from the current file. Use the length field to indicate how many bytes to return. Data will be returned up to 4064 bytes in the alternate buffer (like text input). In the event of error an empty buffer is returned (0 length). 
+
+\xff\xff\x00\x07				- close the currently open file (no notice is returned).
+
+
+----
+
+Starting an already-flashed ROM:
+
+Press 'UP' on the first controller (USB need not be attached). This function is disabled if JCP sends any data, until the next reset.
+
+----
+
+Reset of the Jaguar:
+
+This is not a function of the JCP host, and is accessed by poking through the USB controller directly.
+
+----
+
+Flashing the flash ROM:
+
+This is a separate program launched from JCP - this flash host is first loaded and executed, whereupon it erases the flash and sets the flash as writable. At this point normal JCP access writes the flash.
+
+----
+
+File formats supported:
+
+JCP will attempt to parse headers for standard Cartridge ROM, including with 512 byte header (which is ignored), COFF files, ELF files, and JAG files. It also seems to work with PRG files.
+
+----
+
+Vectors:
+
+There are four 32-bit vectors at $800800 in the flash:
+
+$800800 - Version of startup code 
+$800804 - Address of flash routine in RAM (fixed)
+$800808 - 32-bit serial number
+$80080C - Unset - for future use
+
+----
+
+Flash vector:
+-A special program is used to jump to the flash vector when the boot is locked out.
+-The address $3ff0 contains the number of blocks to flash (long), while $3ff4 contains the
+ same value EORd with $FFFF (long). if invalid, all 63 blocks are flashed. Only '30' and '62'
+ (count-1) are valid today.
+-As of 1.1.0, if $3ff0 has the high bit set, then the slow low voltage word flash is used
+
+----
+
+Program lockout:
+
+Skunkboard locks out certain program files. If these programs are loaded to the flash, Skunkboard will not run any program until the flash is reprogrammed with something else. The new program must be at least 2MB in size.
+
+----
+
+Kevv pages: It took me a few minutes to remember, but now I do.  The flash chip is held in reset until boot completes, except when the boot strap code is being read.  Because it takes the chip a few hundred nanoseconds to exit reset, and because it re-enters reset after each word is read, the boot has to be slowed down for timing purposes.  Until the CPLD and EZ-HOST are initialized, it's not safe to access ROM at full speed.
+
+Kevv pages: Yes, it has to work that way.  To save money on the CPLD I had to use a lower pin version.  I ran out of pins so there is a lot of
+multiplexing going on in the hardware.  The EZ-HOST boot mode pins are multiplexed with the flash control lines, so the EZ-HOST can't be allowed to boot while there is the risk of a flash access, or bad timing could cause the EZ-HOST to enter the wrong mode.  So reset is only pulsed for long enough to get one word out of the Flash, without being high long enough to meet the EZ-HOST's minimum 'exit reset' pulse width.
+
+Kevv pages: That's why the boot code gets copied into DRAM before we attempt to fire up the EZ-HOST.  That way there's no risk of a flash access happening while we wait around for the EZ-HOST to boot.  Once everything is booted you wouldn't even know there's a problem.
