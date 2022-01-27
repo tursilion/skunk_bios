@@ -1,3 +1,5 @@
+3.02
+
 This is the BIOS flash program for the Skunkboard, with the BIOS code embedded within. For code history,
 look inside STARTUP.S. (Actually, for everything look inside STARTUP.S)
 
